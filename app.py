@@ -4,6 +4,7 @@ import requests
 from flask import Flask, request, Response
 from dotenv import load_dotenv
 from datetime import datetime
+from collections import defaultdict # Usado para facilitar a soma no relatório
 
 # Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
@@ -16,8 +17,7 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# --- NOVA ROTA PARA O PINGER ---
-# Esta rota serve apenas para o UptimeRobot visitar e manter o servidor acordado.
+# Rota para manter o servidor do Render acordado
 @app.route('/')
 def home():
     return "Servidor do Bot Financeiro está ativo.", 200
@@ -26,7 +26,7 @@ def home():
 database = {}
 processed_message_ids = set()
 
-# --- FUNÇÃO ATUALIZADA: Integração com a IA Gemini (mais robusta) ---
+# --- FUNÇÃO ATUALIZADA: IA com instruções aprimoradas ---
 def get_ai_interpretation(user_message):
     """
     Envia a mensagem do usuário para a API do Gemini e retorna uma interpretação estruturada.
@@ -37,11 +37,21 @@ def get_ai_interpretation(user_message):
 
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
 
+    # PROMPT MELHORADO: Instruímos a IA a extrair a categoria específica da fala do usuário.
     prompt = f"""
-    Analise a mensagem de um usuário para um bot de finanças.
-    Extraia a intenção (intent) e as entidades (entities) como valor (value) e categoria (category).
-    Intenções possíveis: 'add_expense', 'add_income', 'check_balance', 'list_expenses', 'list_incomes', 'monthly_report', 'unclear'.
-    Mensagem do usuário: "{user_message}"
+    Aja como um assistente financeiro. Analise a mensagem do usuário e extraia a intenção e as entidades em formato JSON.
+
+    - A 'intent' pode ser: 'add_expense', 'add_income', 'check_balance', 'list_expenses', 'list_incomes', 'monthly_report', ou 'unclear'.
+    - A entidade 'value' é o valor numérico da transação.
+    - A entidade 'category' é o item ou motivo específico da transação, extraído diretamente da fala do usuário. NÃO use palavras genéricas como 'despesa' ou 'receita' como categoria, a menos que seja a única opção.
+
+    Exemplos:
+    - Mensagem: "Gastei 500 reais com plantas" -> category: "plantas"
+    - Mensagem: "recebi 1000 do meu salário" -> category: "salário"
+    - Mensagem: "pagamento do aluguel 1500" -> category: "aluguel"
+    - Mensagem: "entrou um pix" -> category: "pix" (se não houver mais detalhes)
+
+    Mensagem do usuário a ser analisada: "{user_message}"
     """
 
     payload = {
@@ -77,7 +87,6 @@ def get_ai_interpretation(user_message):
 
     except requests.exceptions.HTTPError as http_err:
         print(f"ERRO HTTP ao chamar a API do Gemini: {http_err}")
-        print(f"Status Code: {response.status_code}")
         print(f"Resposta do Servidor: {response.text}")
         return {"intent": "api_error", "error": "HTTP Error"}
         
@@ -128,7 +137,8 @@ def webhook():
             if intencao == "add_expense":
                 valor = entidades.get('value', 0)
                 if valor > 0:
-                    categoria = entidades.get('category', 'Geral')
+                    # A IA agora nos dá a categoria específica!
+                    categoria = entidades.get('category', 'Geral').lower()
                     transacao = {"tipo": "despesa", "valor": valor, "categoria": categoria, "data": datetime.now()}
                     database[from_number]['transacoes'].append(transacao)
                     database[from_number]['saldo'] -= valor
@@ -139,7 +149,7 @@ def webhook():
             elif intencao == "add_income":
                 valor = entidades.get('value', 0)
                 if valor > 0:
-                    categoria = entidades.get('category', 'Receitas')
+                    categoria = entidades.get('category', 'Receitas').lower()
                     transacao = {"tipo": "receita", "valor": valor, "categoria": categoria, "data": datetime.now()}
                     database[from_number]['transacoes'].append(transacao)
                     database[from_number]['saldo'] += valor
@@ -169,6 +179,7 @@ def webhook():
                     for t in reversed(receitas[-10:]):
                         resposta_texto += f"- R$ {t['valor']:.2f} em {t['categoria']} ({t['data'].strftime('%d/%m')})\n"
             
+            # --- RELATÓRIO MENSAL APRIMORADO ---
             elif intencao == "monthly_report":
                 hoje = datetime.now()
                 transacoes_mes = [t for t in database[from_number]['transacoes'] if t['data'].month == hoje.month and t['data'].year == hoje.year]
@@ -176,23 +187,43 @@ def webhook():
                 if not transacoes_mes:
                     resposta_texto = f"Você não tem transações em {hoje.strftime('%B')}."
                 else:
-                    total_receitas = sum(t['valor'] for t in transacoes_mes if t['tipo'] == 'receita')
-                    total_despesas = sum(t['valor'] for t in transacoes_mes if t['tipo'] == 'despesa')
+                    despesas_por_categoria = defaultdict(float)
+                    receitas_por_categoria = defaultdict(float)
+
+                    for t in transacoes_mes:
+                        if t['tipo'] == 'despesa':
+                            despesas_por_categoria[t['categoria']] += t['valor']
+                        elif t['tipo'] == 'receita':
+                            receitas_por_categoria[t['categoria']] += t['valor']
+
+                    total_receitas = sum(receitas_por_categoria.values())
+                    total_despesas = sum(despesas_por_categoria.values())
                     balanco = total_receitas - total_despesas
+
+                    resposta_texto = f"📊 *Resumo Detalhado de {hoje.strftime('%B/%Y')}:*\n\n"
+
+                    if receitas_por_categoria:
+                        resposta_texto += "🟢 *Receitas:*\n"
+                        for categoria, valor in sorted(receitas_por_categoria.items(), key=lambda item: item[1], reverse=True):
+                            resposta_texto += f"  - {categoria.capitalize()}: R$ {valor:.2f}\n"
+                        resposta_texto += f"  *Total de Receitas:* R$ {total_receitas:.2f}\n\n"
                     
-                    resposta_texto = f"📊 *Resumo de {hoje.strftime('%B/%Y')}:*\n\n"
-                    resposta_texto += f"🟢 *Receitas:* R$ {total_receitas:.2f}\n"
-                    resposta_texto += f"🔴 *Despesas:* R$ {total_despesas:.2f}\n"
+                    if despesas_por_categoria:
+                        resposta_texto += "🔴 *Despesas:*\n"
+                        for categoria, valor in sorted(despesas_por_categoria.items(), key=lambda item: item[1], reverse=True):
+                            resposta_texto += f"  - {categoria.capitalize()}: R$ {valor:.2f}\n"
+                        resposta_texto += f"  *Total de Despesas:* R$ {total_despesas:.2f}\n\n"
+
                     resposta_texto += f"--------------------\n"
-                    resposta_texto += f"⚖️ *Balanço:* R$ {balanco:.2f}"
+                    resposta_texto += f"⚖️ *Balanço do Mês:* R$ {balanco:.2f}"
 
             else:
                 resposta_texto = (
-                    "🤖 Desculpe, não consegui processar sua solicitação no momento.\n\n"
+                    "🤖 Desculpe, não entendi. Como posso ajudar?\n\n"
                     "Tente algo como:\n"
                     "- `Comprei pão por 10 reais`\n"
                     "- `Recebi um pix de 500`\n"
-                    "- `Quanto eu tenho na conta?`"
+                    "- `relatório mensal`"
                 )
 
             enviar_mensagem_whatsapp(from_number, resposta_texto)
@@ -219,5 +250,4 @@ def enviar_mensagem_whatsapp(to_number, text):
     return response
 
 if __name__ == '__main__':
-    # O Gunicorn vai gerenciar a porta, então não precisamos mais definir aqui.
     app.run()
