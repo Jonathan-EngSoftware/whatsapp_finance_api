@@ -4,7 +4,7 @@ import requests
 from flask import Flask, request, Response
 from dotenv import load_dotenv
 from nlp_processor import processar_mensagem
-from datetime import datetime # Importa o módulo de data e hora
+from datetime import datetime
 
 # Carrega as variáveis de ambiente
 load_dotenv()
@@ -18,6 +18,9 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 # --- Banco de Dados Simulado ---
 database = {}
+# --- NOVA ADIÇÃO: Conjunto para armazenar IDs de mensagens já processadas ---
+# Usamos um 'set' para buscas rápidas. Ele guardará os IDs únicos das mensagens.
+processed_message_ids = set()
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
@@ -33,10 +36,25 @@ def webhook():
         
         if data and data.get('entry') and data['entry'][0].get('changes') and data['entry'][0]['changes'][0].get('value') and data['entry'][0]['changes'][0]['value'].get('messages'):
             message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
+            
+            # --- NOVA ADIÇÃO: Lógica para evitar duplicatas ---
+            message_id = message_data.get('id') # Pega o ID único da mensagem (wamid)
+            
+            # Se o ID da mensagem já está no nosso conjunto, é uma duplicata.
+            if message_id in processed_message_ids:
+                print(f"Mensagem duplicada recebida, ID: {message_id}. Ignorando.")
+                return Response(status=200) # Apenas confirma o recebimento para a Meta parar de reenviar.
+            
+            # Se for uma mensagem nova, adiciona o ID ao conjunto para processá-la.
+            processed_message_ids.add(message_id)
+            # Para evitar que o conjunto cresça indefinidamente, podemos limitar seu tamanho
+            if len(processed_message_ids) > 1000:
+                processed_message_ids.pop() # Remove um item antigo
+
             from_number = message_data['from']
             msg_body = message_data['text']['body']
             
-            print(f"Mensagem de {from_number}: {msg_body}")
+            print(f"Nova mensagem de {from_number}: {msg_body}")
 
             # 1. Processa a mensagem com IA
             resultado_nlp = processar_mensagem(msg_body)
@@ -50,12 +68,10 @@ def webhook():
             resposta_texto = ""
             
             # --- LÓGICA ATUALIZADA COM NOVAS FUNÇÕES ---
-
             if intencao == "adicionar_despesa":
                 valor = entidades.get('valor', 0)
                 if valor > 0:
                     categoria = entidades.get('categoria', 'Geral')
-                    # ADICIONA A DATA E HORA ATUAL À TRANSAÇÃO
                     transacao = {"tipo": "despesa", "valor": valor, "categoria": categoria, "data": datetime.now()}
                     database[from_number]['transacoes'].append(transacao)
                     database[from_number]['saldo'] -= valor
@@ -67,7 +83,6 @@ def webhook():
                 valor = entidades.get('valor', 0)
                 if valor > 0:
                     categoria = entidades.get('categoria', 'Receitas')
-                    # ADICIONA A DATA E HORA ATUAL À TRANSAÇÃO
                     transacao = {"tipo": "receita", "valor": valor, "categoria": categoria, "data": datetime.now()}
                     database[from_number]['transacoes'].append(transacao)
                     database[from_number]['saldo'] += valor
@@ -79,29 +94,24 @@ def webhook():
                 saldo_atual = database[from_number]['saldo']
                 resposta_texto = f"💰 Seu saldo atual é de R$ {saldo_atual:.2f}."
 
-            # --- NOVA FUNÇÃO: LISTAR DESPESAS ---
             elif intencao == "listar_despesas":
                 despesas = [t for t in database[from_number]['transacoes'] if t['tipo'] == 'despesa']
                 if not despesas:
                     resposta_texto = "Você ainda não registrou nenhuma despesa."
                 else:
                     resposta_texto = "🧾 *Suas últimas despesas:*\n"
-                    # Mostra as últimas 10 para não poluir o chat
                     for t in reversed(despesas[-10:]):
                         resposta_texto += f"- R$ {t['valor']:.2f} em {t['categoria']} ({t['data'].strftime('%d/%m')})\n"
 
-            # --- NOVA FUNÇÃO: LISTAR RECEITAS ---
             elif intencao == "listar_receitas":
                 receitas = [t for t in database[from_number]['transacoes'] if t['tipo'] == 'receita']
                 if not receitas:
                     resposta_texto = "Você ainda não registrou nenhuma receita."
                 else:
                     resposta_texto = "📈 *Suas últimas receitas:*\n"
-                    # Mostra as últimas 10
                     for t in reversed(receitas[-10:]):
                         resposta_texto += f"- R$ {t['valor']:.2f} em {t['categoria']} ({t['data'].strftime('%d/%m')})\n"
             
-            # --- NOVA FUNÇÃO: RELATÓRIO MENSAL ---
             elif intencao == "relatorio_mensal":
                 hoje = datetime.now()
                 transacoes_mes = [t for t in database[from_number]['transacoes'] if t['data'].month == hoje.month and t['data'].year == hoje.year]
