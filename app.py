@@ -14,7 +14,13 @@ app = Flask(__name__)
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Carrega a chave da API do Gemini
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# --- NOVA ROTA PARA O PINGER ---
+# Esta rota serve apenas para o UptimeRobot visitar e manter o servidor acordado.
+@app.route('/')
+def home():
+    return "Servidor do Bot Financeiro está ativo.", 200
 
 # --- Banco de Dados Simulado e Controle de Mensagens ---
 database = {}
@@ -25,14 +31,12 @@ def get_ai_interpretation(user_message):
     """
     Envia a mensagem do usuário para a API do Gemini e retorna uma interpretação estruturada.
     """
-    # 1. Validação da Chave de API
     if not GEMINI_API_KEY:
-        print("ERRO CRÍTICO: A variável GEMINI_API_KEY não foi encontrada no arquivo .env.")
+        print("ERRO CRÍTICO: A variável GEMINI_API_KEY não foi encontrada.")
         return {"intent": "api_error", "error": "API Key not configured"}
 
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
 
-    # 2. Prompt claro e estruturado para a IA
     prompt = f"""
     Analise a mensagem de um usuário para um bot de finanças.
     Extraia a intenção (intent) e as entidades (entities) como valor (value) e categoria (category).
@@ -61,11 +65,10 @@ def get_ai_interpretation(user_message):
     }
     headers = {'Content-Type': 'application/json'}
 
-    # 3. Tratamento de Erros Detalhado
     try:
         print("Enviando requisição para a API do Gemini...")
         response = requests.post(api_url, headers=headers, json=payload, timeout=25)
-        response.raise_for_status()  # Lança um erro para respostas 4xx ou 5xx
+        response.raise_for_status()
 
         result = response.json()
         json_text = result['candidates'][0]['content']['parts'][0]['text']
@@ -73,19 +76,16 @@ def get_ai_interpretation(user_message):
         return json.loads(json_text)
 
     except requests.exceptions.HTTPError as http_err:
-        # Erro de autenticação (401, 403) ou de requisição (400)
         print(f"ERRO HTTP ao chamar a API do Gemini: {http_err}")
         print(f"Status Code: {response.status_code}")
-        print(f"Resposta do Servidor: {response.text}") # ESSENCIAL PARA DEBUGAR
+        print(f"Resposta do Servidor: {response.text}")
         return {"intent": "api_error", "error": "HTTP Error"}
         
     except requests.exceptions.RequestException as e:
-        # Erro de rede, DNS, timeout, etc.
         print(f"ERRO de Conexão ao chamar a API do Gemini: {e}")
         return {"intent": "api_error", "error": "Connection Error"}
         
     except (KeyError, IndexError, json.JSONDecodeError) as e:
-        # A resposta da IA não veio no formato esperado
         print(f"ERRO ao processar a resposta da IA: {e}")
         print(f"Resposta bruta recebida: {result if 'result' in locals() else 'N/A'}")
         return {"intent": "api_error", "error": "Parsing Error"}
@@ -116,12 +116,10 @@ def webhook():
             
             print(f"\n--- Nova Mensagem de {from_number}: {msg_body} ---")
 
-            # 1. Processa a mensagem com a IA Gemini
             ai_response = get_ai_interpretation(msg_body)
             intencao = ai_response.get('intent', 'unclear')
             entidades = ai_response.get('entities', {})
 
-            # 2. Lógica de negócio
             if from_number not in database:
                 database[from_number] = {"transacoes": [], "saldo": 0.0}
 
@@ -136,7 +134,7 @@ def webhook():
                     database[from_number]['saldo'] -= valor
                     resposta_texto = f"✅ Despesa de R$ {valor:.2f} em '{categoria}' registrada. Saldo: R$ {database[from_number]['saldo']:.2f}."
                 else:
-                    resposta_texto = "🤔 Não consegui identificar o valor da despesa. Tente 'gastei 50 com café'."
+                    resposta_texto = "🤔 Não consegui identificar o valor da despesa."
 
             elif intencao == "add_income":
                 valor = entidades.get('value', 0)
@@ -147,7 +145,7 @@ def webhook():
                     database[from_number]['saldo'] += valor
                     resposta_texto = f"✅ Receita de R$ {valor:.2f} em '{categoria}' registrada. Saldo: R$ {database[from_number]['saldo']:.2f}."
                 else:
-                    resposta_texto = "🤔 Não consegui identificar o valor da receita. Tente 'recebi 500'."
+                    resposta_texto = "🤔 Não consegui identificar o valor da receita."
 
             elif intencao == "check_balance":
                 saldo_atual = database[from_number]['saldo']
@@ -188,16 +186,15 @@ def webhook():
                     resposta_texto += f"--------------------\n"
                     resposta_texto += f"⚖️ *Balanço:* R$ {balanco:.2f}"
 
-            else: # Para 'unclear' ou 'api_error'
+            else:
                 resposta_texto = (
-                    "🤖 Desculpe, não consegui processar sua solicitação no momento. Verifique se sua mensagem foi clara.\n\n"
+                    "🤖 Desculpe, não consegui processar sua solicitação no momento.\n\n"
                     "Tente algo como:\n"
                     "- `Comprei pão por 10 reais`\n"
                     "- `Recebi um pix de 500`\n"
                     "- `Quanto eu tenho na conta?`"
                 )
 
-            # 3. Envia a resposta de volta para o usuário
             enviar_mensagem_whatsapp(from_number, resposta_texto)
             print("Banco de dados simulado:", database)
 
@@ -222,4 +219,5 @@ def enviar_mensagem_whatsapp(to_number, text):
     return response
 
 if __name__ == '__main__':
-    app.run(port=5000, debug=True)
+    # O Gunicorn vai gerenciar a porta, então não precisamos mais definir aqui.
+    app.run()
