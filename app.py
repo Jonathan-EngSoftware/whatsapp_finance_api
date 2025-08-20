@@ -233,7 +233,6 @@ def webhook():
 
     return 'Método não permitido', 405
 
-
 def enviar_mensagem_whatsapp(to_number, text):
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -248,6 +247,5 @@ def enviar_mensagem_whatsapp(to_number, text):
     response = requests.post(url, headers=headers, json=data)
     print("Resposta da API da Meta:", response.status_code)
     return response
-
 if __name__ == '__main__':
     app.run()
