@@ -3,29 +3,97 @@ import json
 import requests
 from flask import Flask, request, Response
 from dotenv import load_dotenv
-from nlp_processor import processar_mensagem
 from datetime import datetime
 
-# Carrega as variáveis de ambiente
+# Carrega as variáveis de ambiente do arquivo .env
 load_dotenv()
 
 app = Flask(__name__)
 
-# Suas credenciais da Meta
+# Suas credenciais
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Carrega a chave da API do Gemini
 
-# --- Banco de Dados Simulado ---
+# --- Banco de Dados Simulado e Controle de Mensagens ---
 database = {}
-# --- NOVA ADIÇÃO: Conjunto para armazenar IDs de mensagens já processadas ---
-# Usamos um 'set' para buscas rápidas. Ele guardará os IDs únicos das mensagens.
 processed_message_ids = set()
+
+# --- FUNÇÃO ATUALIZADA: Integração com a IA Gemini (mais robusta) ---
+def get_ai_interpretation(user_message):
+    """
+    Envia a mensagem do usuário para a API do Gemini e retorna uma interpretação estruturada.
+    """
+    # 1. Validação da Chave de API
+    if not GEMINI_API_KEY:
+        print("ERRO CRÍTICO: A variável GEMINI_API_KEY não foi encontrada no arquivo .env.")
+        return {"intent": "api_error", "error": "API Key not configured"}
+
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key={GEMINI_API_KEY}"
+
+    # 2. Prompt claro e estruturado para a IA
+    prompt = f"""
+    Analise a mensagem de um usuário para um bot de finanças.
+    Extraia a intenção (intent) e as entidades (entities) como valor (value) e categoria (category).
+    Intenções possíveis: 'add_expense', 'add_income', 'check_balance', 'list_expenses', 'list_incomes', 'monthly_report', 'unclear'.
+    Mensagem do usuário: "{user_message}"
+    """
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": {
+                "type": "OBJECT",
+                "properties": {
+                    "intent": {"type": "STRING"},
+                    "entities": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "value": {"type": "NUMBER"},
+                            "category": {"type": "STRING"}
+                        }
+                    }
+                }
+            }
+        }
+    }
+    headers = {'Content-Type': 'application/json'}
+
+    # 3. Tratamento de Erros Detalhado
+    try:
+        print("Enviando requisição para a API do Gemini...")
+        response = requests.post(api_url, headers=headers, json=payload, timeout=25)
+        response.raise_for_status()  # Lança um erro para respostas 4xx ou 5xx
+
+        result = response.json()
+        json_text = result['candidates'][0]['content']['parts'][0]['text']
+        print(f"Resposta JSON da IA recebida: {json_text}")
+        return json.loads(json_text)
+
+    except requests.exceptions.HTTPError as http_err:
+        # Erro de autenticação (401, 403) ou de requisição (400)
+        print(f"ERRO HTTP ao chamar a API do Gemini: {http_err}")
+        print(f"Status Code: {response.status_code}")
+        print(f"Resposta do Servidor: {response.text}") # ESSENCIAL PARA DEBUGAR
+        return {"intent": "api_error", "error": "HTTP Error"}
+        
+    except requests.exceptions.RequestException as e:
+        # Erro de rede, DNS, timeout, etc.
+        print(f"ERRO de Conexão ao chamar a API do Gemini: {e}")
+        return {"intent": "api_error", "error": "Connection Error"}
+        
+    except (KeyError, IndexError, json.JSONDecodeError) as e:
+        # A resposta da IA não veio no formato esperado
+        print(f"ERRO ao processar a resposta da IA: {e}")
+        print(f"Resposta bruta recebida: {result if 'result' in locals() else 'N/A'}")
+        return {"intent": "api_error", "error": "Parsing Error"}
+
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     if request.method == 'GET':
-        # Verificação do Webhook da Meta
         if request.args.get('hub.mode') == 'subscribe' and request.args.get('hub.verify_token') == VERIFY_TOKEN:
             return request.args.get('hub.challenge'), 200
         else:
@@ -36,30 +104,22 @@ def webhook():
         
         if data and data.get('entry') and data['entry'][0].get('changes') and data['entry'][0]['changes'][0].get('value') and data['entry'][0]['changes'][0]['value'].get('messages'):
             message_data = data['entry'][0]['changes'][0]['value']['messages'][0]
+            message_id = message_data.get('id')
             
-            # --- NOVA ADIÇÃO: Lógica para evitar duplicatas ---
-            message_id = message_data.get('id') # Pega o ID único da mensagem (wamid)
-            
-            # Se o ID da mensagem já está no nosso conjunto, é uma duplicata.
             if message_id in processed_message_ids:
-                print(f"Mensagem duplicada recebida, ID: {message_id}. Ignorando.")
-                return Response(status=200) # Apenas confirma o recebimento para a Meta parar de reenviar.
+                return Response(status=200)
             
-            # Se for uma mensagem nova, adiciona o ID ao conjunto para processá-la.
             processed_message_ids.add(message_id)
-            # Para evitar que o conjunto cresça indefinidamente, podemos limitar seu tamanho
-            if len(processed_message_ids) > 1000:
-                processed_message_ids.pop() # Remove um item antigo
 
             from_number = message_data['from']
             msg_body = message_data['text']['body']
             
-            print(f"Nova mensagem de {from_number}: {msg_body}")
+            print(f"\n--- Nova Mensagem de {from_number}: {msg_body} ---")
 
-            # 1. Processa a mensagem com IA
-            resultado_nlp = processar_mensagem(msg_body)
-            intencao = resultado_nlp['intencao']
-            entidades = resultado_nlp['entidades']
+            # 1. Processa a mensagem com a IA Gemini
+            ai_response = get_ai_interpretation(msg_body)
+            intencao = ai_response.get('intent', 'unclear')
+            entidades = ai_response.get('entities', {})
 
             # 2. Lógica de negócio
             if from_number not in database:
@@ -67,34 +127,33 @@ def webhook():
 
             resposta_texto = ""
             
-            # --- LÓGICA ATUALIZADA COM NOVAS FUNÇÕES ---
-            if intencao == "adicionar_despesa":
-                valor = entidades.get('valor', 0)
+            if intencao == "add_expense":
+                valor = entidades.get('value', 0)
                 if valor > 0:
-                    categoria = entidades.get('categoria', 'Geral')
+                    categoria = entidades.get('category', 'Geral')
                     transacao = {"tipo": "despesa", "valor": valor, "categoria": categoria, "data": datetime.now()}
                     database[from_number]['transacoes'].append(transacao)
                     database[from_number]['saldo'] -= valor
-                    resposta_texto = f"✅ Despesa de R$ {valor:.2f} na categoria '{categoria}' registrada. Seu novo saldo é R$ {database[from_number]['saldo']:.2f}."
+                    resposta_texto = f"✅ Despesa de R$ {valor:.2f} em '{categoria}' registrada. Saldo: R$ {database[from_number]['saldo']:.2f}."
                 else:
-                    resposta_texto = "🤔 Não consegui identificar o valor da despesa. Tente algo como 'gastei 50 com café'."
+                    resposta_texto = "🤔 Não consegui identificar o valor da despesa. Tente 'gastei 50 com café'."
 
-            elif intencao == "adicionar_receita":
-                valor = entidades.get('valor', 0)
+            elif intencao == "add_income":
+                valor = entidades.get('value', 0)
                 if valor > 0:
-                    categoria = entidades.get('categoria', 'Receitas')
+                    categoria = entidades.get('category', 'Receitas')
                     transacao = {"tipo": "receita", "valor": valor, "categoria": categoria, "data": datetime.now()}
                     database[from_number]['transacoes'].append(transacao)
                     database[from_number]['saldo'] += valor
-                    resposta_texto = f"✅ Receita de R$ {valor:.2f} na categoria '{categoria}' registrada. Seu novo saldo é R$ {database[from_number]['saldo']:.2f}."
+                    resposta_texto = f"✅ Receita de R$ {valor:.2f} em '{categoria}' registrada. Saldo: R$ {database[from_number]['saldo']:.2f}."
                 else:
-                    resposta_texto = "🤔 Não consegui identificar o valor da receita. Tente algo como 'recebi 500 de um trabalho'."
+                    resposta_texto = "🤔 Não consegui identificar o valor da receita. Tente 'recebi 500'."
 
-            elif intencao == "ver_saldo":
+            elif intencao == "check_balance":
                 saldo_atual = database[from_number]['saldo']
                 resposta_texto = f"💰 Seu saldo atual é de R$ {saldo_atual:.2f}."
 
-            elif intencao == "listar_despesas":
+            elif intencao == "list_expenses":
                 despesas = [t for t in database[from_number]['transacoes'] if t['tipo'] == 'despesa']
                 if not despesas:
                     resposta_texto = "Você ainda não registrou nenhuma despesa."
@@ -103,7 +162,7 @@ def webhook():
                     for t in reversed(despesas[-10:]):
                         resposta_texto += f"- R$ {t['valor']:.2f} em {t['categoria']} ({t['data'].strftime('%d/%m')})\n"
 
-            elif intencao == "listar_receitas":
+            elif intencao == "list_incomes":
                 receitas = [t for t in database[from_number]['transacoes'] if t['tipo'] == 'receita']
                 if not receitas:
                     resposta_texto = "Você ainda não registrou nenhuma receita."
@@ -112,12 +171,12 @@ def webhook():
                     for t in reversed(receitas[-10:]):
                         resposta_texto += f"- R$ {t['valor']:.2f} em {t['categoria']} ({t['data'].strftime('%d/%m')})\n"
             
-            elif intencao == "relatorio_mensal":
+            elif intencao == "monthly_report":
                 hoje = datetime.now()
                 transacoes_mes = [t for t in database[from_number]['transacoes'] if t['data'].month == hoje.month and t['data'].year == hoje.year]
                 
                 if not transacoes_mes:
-                    resposta_texto = f"Você não tem nenhuma transação registrada em {hoje.strftime('%B')}."
+                    resposta_texto = f"Você não tem transações em {hoje.strftime('%B')}."
                 else:
                     total_receitas = sum(t['valor'] for t in transacoes_mes if t['tipo'] == 'receita')
                     total_despesas = sum(t['valor'] for t in transacoes_mes if t['tipo'] == 'despesa')
@@ -129,15 +188,13 @@ def webhook():
                     resposta_texto += f"--------------------\n"
                     resposta_texto += f"⚖️ *Balanço:* R$ {balanco:.2f}"
 
-            else:
+            else: # Para 'unclear' ou 'api_error'
                 resposta_texto = (
-                    "🤖 Olá! Sou seu assistente financeiro. O que você gostaria de fazer?\n\n"
-                    "Você pode tentar:\n"
-                    "- `Gastei 50 com almoço`\n"
-                    "- `Recebi 1000 de salário`\n"
-                    "- `Qual meu saldo?`\n"
-                    "- `Listar minhas despesas`\n"
-                    "- `Relatório mensal`"
+                    "🤖 Desculpe, não consegui processar sua solicitação no momento. Verifique se sua mensagem foi clara.\n\n"
+                    "Tente algo como:\n"
+                    "- `Comprei pão por 10 reais`\n"
+                    "- `Recebi um pix de 500`\n"
+                    "- `Quanto eu tenho na conta?`"
                 )
 
             # 3. Envia a resposta de volta para o usuário
@@ -150,9 +207,6 @@ def webhook():
 
 
 def enviar_mensagem_whatsapp(to_number, text):
-    """
-    Função para enviar a mensagem usando a API da Meta
-    """
     url = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
@@ -164,7 +218,7 @@ def enviar_mensagem_whatsapp(to_number, text):
         "text": {"body": text}
     }
     response = requests.post(url, headers=headers, json=data)
-    print("Resposta da API da Meta:", response.status_code, response.json())
+    print("Resposta da API da Meta:", response.status_code)
     return response
 
 if __name__ == '__main__':
